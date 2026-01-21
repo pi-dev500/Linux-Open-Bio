@@ -2,7 +2,7 @@
 import sys
 import cv2
 import numpy as np
-
+import keyboard
 import os
 import subprocess
 import pickle
@@ -121,196 +121,56 @@ def ensure_bgr(frame):
     else:
         raise ValueError("Unsupported frame shape")
 
-def stretch_contrast(img_bgr):
-    # Split channels
-    channels = cv2.split(img_bgr)
-    stretched = []
-
-    for ch in channels:
-        min_val, max_val = np.min(ch), np.max(ch)
-        # Avoid divide-by-zero
-        if max_val > min_val:
-            norm = ((ch - min_val) * 255.0 / (max_val - min_val)).astype(np.uint8)
-        else:
-            norm = ch
-        stretched.append(norm)
-
-    return cv2.merge(stretched)
-
-# Image improvements
-def gray_world_correction(img):
-    avg_b = np.mean(img[:, :, 0])
-    avg_g = np.mean(img[:, :, 1])
-    avg_r = np.mean(img[:, :, 2])
-
-    avg_gray = (avg_b + avg_g + avg_r) / 3
-    scale_b = avg_gray / avg_b
-    scale_g = avg_gray / avg_g
-    scale_r = avg_gray / avg_r
-
-    img[:, :, 0] = np.clip(img[:, :, 0] * scale_b, 0, 255)
-    img[:, :, 1] = np.clip(img[:, :, 1] * scale_g, 0, 255)
-    img[:, :, 2] = np.clip(img[:, :, 2] * scale_r, 0, 255)
-
-    return img.astype(np.uint8)
-
-def apply_gamma(img, gamma):
-    """Apply gamma correction to an image (input range 0-255)"""
-    # Build lookup table
-    inv_gamma = 1.0 / gamma
-    table = np.array([((i / 255.0) ** inv_gamma) * 255
-                     for i in np.arange(0, 256)]).astype("uint8")
-    
-    # Apply gamma correction
-    return cv2.LUT(img, table)
-
-def apply_clahe_bgr(img_bgr):
-    # Convert BGR to YUV
-    img_yuv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YUV)
-
-    # Apply CLAHE to the Y channel (luminance)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    img_yuv[:, :, 0] = clahe.apply(img_yuv[:, :, 0])
-
-    # Convert back to BGR
-    img_clahe = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2BGR)
-
-    return img_clahe
-
-def adaptive_face_preprocessing(img_bgr, 
-                               auto_gamma=True, 
-                               edge_weight=0.1,
-                               ir_mode=False):
+def recognition_preprocess(img_bgr):
     """
-    Enhanced pipeline with:
-    1. Dynamic gamma correction
-    2. Adaptive histogram equalization
-    3. Edge-aware normalization
-    4. Cross-camera compatibility
+    SAFE preprocessing for face embeddings.
+    Photometrically stable, identity-preserving.
     """
-    img_bgr = stretch_contrast(img_bgr)
-    # Convert to grayscale/Y-channel processing
-    if ir_mode:
-        # IR camera-specific processing
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    else:
-        # RGB camera processing
-        yuv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YUV)
-        gray = yuv[:,:,0]
+    # Mild chroma denoise (sensor noise, not texture)
+    img = cv2.fastNlMeansDenoisingColored(
+        img_bgr, None,
+        h=3, hColor=8,
+        templateWindowSize=7,
+        searchWindowSize=21
+    )
 
-    # 1. Dynamic gamma correction
-    if auto_gamma:
-        gamma = calculate_adaptive_gamma(gray)
-    else:
-        gamma = 0.8 if ir_mode else 1.2  # Baseline values
-    
-    gamma_corrected = apply_gamma(img_bgr, gamma)
+    # Convert to YCrCb
+    ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+    y, cr, cb = cv2.split(ycrcb)
 
-    # 2. Adaptive histogram equalization
-    equalized = apply_clahe_bgr(gamma_corrected)
+    # Gentle, bounded gamma
+    mean = y.mean()
+    gamma = 1.1 if mean < 100 else 0.95
+    y = np.clip((y / 255.0) ** (1 / gamma) * 255, 0, 255).astype(np.uint8)
 
-    # 3. Edge-aware normalization
-    edges = optimized_canny(equalized, sigma=1.4, 
-                          low_thresh=30, high_thresh=70)
-    
-    # 4. Edge-enhanced fusion
-    final = edge_blend_bgr(equalized, edges, edge_weight)
+    out = cv2.merge((y, cr, cb))
+    return cv2.cvtColor(out, cv2.COLOR_YCrCb2BGR)
 
-    return final
 
-def calculate_adaptive_gamma(gray_img):
-    """Auto-determine gamma based on image brightness"""
-    mean_brightness = np.mean(gray_img)
-    return np.clip(0.5 + (mean_brightness/255), 0.3, 2.0)
+def recognition_quality(face_bgr):
+    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
 
-def optimized_canny(img, sigma=1.4, low_thresh=30, high_thresh=70):
-    """Improved Canny with noise-aware thresholds"""
-    blurred = cv2.GaussianBlur(img, (5,5), sigma)
-    grad_x = cv2.Sobel(blurred, cv2.CV_16S, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(blurred, cv2.CV_16S, 0, 1, ksize=3)
-    
-    # Dynamic thresholding based on gradient magnitudes
-    mag = np.sqrt(grad_x**2 + grad_y**2)
-    non_zero = mag[mag > 0]
-    if len(non_zero) > 0:
-        high = np.percentile(non_zero, 95)
-        low = high * 0.5
-        return cv2.Canny(blurred, low, high)
-    return np.zeros_like(img)
+    # Blur check
+    blur = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if blur < 30:
+        print("blur")
+        return 0.0
 
-def edge_blend_bgr(img_bgr, edges, edge_weight=0.3):
-    """
-    Blends grayscale edge map into each BGR channel.
-    Assumes edges is normalized to [0, 1] or [0, 255]
-    """
-    # Normalize edges to 0–1
-    if edges.max() > 1:
-        edges = edges.astype(np.float32) / 255.0
+    # Exposure check
+    mean = gray.mean()
+    if mean < 20 or mean > 210:
+        print("mean")
+        return 0.0
 
-    # Convert BGR to float
-    img_bgr = img_bgr.astype(np.float32) / 255.0
+    # Aspect sanity (face not truncated)
+    h, w = gray.shape
+    aspect = w / h
+    if aspect < 0.6 or aspect > 1.6:
+        print("aspect")
+        return 0.0
 
-    # Expand edges to 3 channels
-    edges_3ch = np.stack([edges]*3, axis=-1)
-
-    # Blend
-    blended = (1 - edge_weight) * img_bgr + edge_weight * edges_3ch
-    blended = np.clip(blended * 255, 0, 255).astype(np.uint8)
-
-    return blended
-
-def image_quality_score(img_bgr,
-                        w_sharp=0.4,
-                        w_contrast=0.4,
-                        w_noise=0.2,
-                        sharp_thresh=(100, 1000),
-                        contrast_thresh=(10, 70),
-                        noise_thresh=(0.01, 0.1)):
-    """
-    Compute a quality score in [0,1] for a BGR image.
-
-    Parameters
-    ----------
-    img_bgr : np.ndarray
-        Input image in BGR (uint8).
-    w_sharp, w_contrast, w_noise : float
-        Weights for sharpness, contrast, and noise in the final score.
-        Must sum to 1.0.
-    sharp_thresh : (low, high)
-        Expected min/max of Laplacian variance for good focus.
-    contrast_thresh : (low, high)
-        Expected min/max of RMS contrast for good lighting.
-    noise_thresh : (low, high)
-        Expected min/max of estimated noise std for acceptable noise levels.
-
-    Returns
-    -------
-    score : float
-        Quality score between 0 (worst) and 1 (best).
-    """
-    # 1) Sharpness: variance of Laplacian
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    lap = cv2.Laplacian(gray, cv2.CV_64F)
-    var_lap = lap.var()
-    # normalize to [0,1]
-    s = np.clip((var_lap - sharp_thresh[0]) / (sharp_thresh[1] - sharp_thresh[0]), 0, 1)
-    
-    # 2) Contrast: RMS contrast = std(gray)
-    rms_contrast = gray.std()
-    c = np.clip((rms_contrast - contrast_thresh[0]) / (contrast_thresh[1] - contrast_thresh[0]), 0, 1)
-    
-    # 3) Noise: estimate via patch-based standard deviation of high-freq residual
-    #    subtract a 3×3 mean filter to isolate noise
-    blur = cv2.blur(gray, (3,3))
-    residual = gray.astype(np.float32) - blur.astype(np.float32)
-    noise_std = residual.std() / 255.0  # normalize to [0,1]
-    # lower noise_std is better, so invert and normalize
-    n = np.clip((noise_thresh[1] - noise_std) / (noise_thresh[1] - noise_thresh[0]), 0, 1)
-    
-    # Combine
-    score = w_sharp*s + w_contrast*c + w_noise*n
-    return float(score)
+    # Normalized quality score
+    return min(1.0, blur / 100.0)
 
 def check_light(image): # don't try if laptop camera is obstructed
     to_check = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -366,8 +226,7 @@ def align_face_with_landmarks(face_bgr, orig_frame, bbox, output_size=(128, 128)
     Returns:
         np.ndarray: Aligned face image of shape (output_size[1], output_size[0], 3).
     """
-    output = adaptive_face_preprocessing(face_bgr)
-    #output=face_bgr
+    output = face_bgr
     # 1. Get model I/O information
     input_info = compiled_landmarks.inputs[0]
     output_info = compiled_landmarks.outputs[0]
@@ -498,11 +357,7 @@ def check(username,n_try=5, timeout=RECOGNITION_TIMEOUT, commands_trigger=()):
         if not ret:
             break
         frame = ensure_bgr(frame)
-        if not image_quality_score(frame)>0.2:
-            failed_find_attempts[current_cap] += 1
-            continue
-        else:
-            failed_find_attempts[current_cap] //= 2
+        
         
         # 1. Detect faces using the detection model
         # Preprocess frame for detection (resize to model's expected input, e.g., 300x300)
@@ -519,13 +374,12 @@ def check(username,n_try=5, timeout=RECOGNITION_TIMEOUT, commands_trigger=()):
         for (xmin, ymin, xmax, ymax, conf, _) in boxes:
             # Crop the detected face from the original frame
             face_crop = frame[ymin:ymax, xmin:xmax]
-            if not image_quality_score(face_crop) > 0.25:
+            if not recognition_quality(face_crop) > 0.25:
                 continue
             did_try=1
 
             # Preprocess the face crop
-            rec_face = stretch_contrast(face_crop) # first improve contrast to ensure correct recognition of landmarks
-            rec_face, anti_spoof_face = align_face_with_landmarks(rec_face, frame, (xmin,ymin,xmax,ymax))
+            rec_face, anti_spoof_face = align_face_with_landmarks(face_crop, frame, (xmin,ymin,xmax,ymax))
             
             # Run the anti-spoof model on the larger face crop
             anti_spoof_face = cv2.resize(anti_spoof_face,[80,80]).transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
@@ -538,7 +392,7 @@ def check(username,n_try=5, timeout=RECOGNITION_TIMEOUT, commands_trigger=()):
                 break
             
             # Run recognition model on face crop
-            rec_input = adaptive_face_preprocessing(rec_face).transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
+            rec_input = recognition_preprocess(rec_face).transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
             rec_embedding = compiled_rec([rec_input])[compiled_rec.output(0)]
 
             # Compare with every reference embedding
@@ -602,80 +456,84 @@ def add_face(cap_path=...,face_name=...,complete=False):
     cap = cv2.VideoCapture(cap_path, cv2.CAP_V4L2)
     if not cap.isOpened():
         return "Error: Failed to open Webcam"
-    while True:
-        appended=False
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = ensure_bgr(frame)
-        h,w,c = frame.shape
-        
-        # 1. Detect faces using the detection model
-        # Preprocess frame for detection (resize to model's expected input, e.g., 300x300)
-        det_input_size = (300, 300)  # Adjust if needed
-        frame_resized = cv2.resize(frame, det_input_size)
-        # Assume detection model requires CHW; adjust conversion if needed
-        input_blob_det = frame_resized.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
-        # Run detection
-        det_result = compiled_det([input_blob_det])[compiled_det.output(0)]
-        # Parse detection output (update parsing based on your model’s output format)
-        boxes = parse_detections(det_result, frame.shape, conf_threshold=FACE_THRESHOLD)
-        appened=False
-        for (xmin, ymin, xmax, ymax, conf, _) in boxes:
-            xmin, ymin = max(xmin - 10,0), max(ymin - 10,0) # Leave some margin to get a usable result after re-alignment 
-            xmax, ymax = min(xmax + 10,w), min(ymax + 10,h)
-            # Crop the detected face from the original frame
-            face_crop = frame[ymin:ymax, xmin:xmax]
-            crop_dims=xmax-xmin,ymax-ymin
-            if not image_quality_score(face_crop)>0.3:
-                continue # skip unusable faces crop
-            # Vertically align the face crop using landmarks detection
-            rec_face = stretch_contrast(face_crop)
-            rec_face , anti_spoof_face = align_face_with_landmarks(rec_face, frame, (xmin,ymin,xmax,ymax))
-            #rec_face=gray_world_correction(rec_face)
-            frame[ymin:ymax, xmin:xmax] = cv2.resize(anti_spoof_face,crop_dims)
-            # 3. Run recognition on the face crop
-            rec_input = rec_face.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
-            rec_embedding = compiled_rec([rec_input])[compiled_rec.output(0)]
-            # Compare with every reference embedding
-            similarities = [cosine_similarity(ref_emb, rec_embedding) for ref_emb in new_face]
-            face_preview = cv2.resize(rec_face, (128, 128))
-            # You can adjust your threshold accordingly
-            if username == "root":
-                print(display_bgr_term(rec_face),end="")
-            if all([0.2 < sim < IMPROVE_THRESHOLD for sim in similarities]) or len(new_face)==0: # use as training image
-                new_face.append(rec_embedding)
-                appened=True
-            break
-        if appened:
-            quality_score = image_quality_score(frame)
-            if not complete:
-                total_progress+=((quality_score)*4.5) 
+    try:
+        while True:
+            appended=False
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = ensure_bgr(frame)
+            h,w,c = frame.shape
+            
+            # 1. Detect faces using the detection model
+            # Preprocess frame for detection (resize to model's expected input, e.g., 300x300)
+            det_input_size = (300, 300)  # Adjust if needed
+            frame_resized = cv2.resize(frame, det_input_size)
+            # Assume detection model requires CHW; adjust conversion if needed
+            input_blob_det = frame_resized.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
+            # Run detection
+            det_result = compiled_det([input_blob_det])[compiled_det.output(0)]
+            # Parse detection output (update parsing based on your model’s output format)
+            boxes = parse_detections(det_result, frame.shape, conf_threshold=FACE_THRESHOLD)
+            appened=False
+            for (xmin, ymin, xmax, ymax, conf, _) in boxes:
+                xmin, ymin = max(xmin - 10,0), max(ymin - 10,0) # Leave some margin to get a usable result after re-alignment 
+                xmax, ymax = min(xmax + 10,w), min(ymax + 10,h)
+                # Crop the detected face from the original frame
+                face_crop = frame[ymin:ymax, xmin:xmax]
+                crop_dims=xmax-xmin,ymax-ymin
+                print(recognition_quality(face_crop))
+                if not recognition_quality(face_crop)>0.3:
+                    continue # skip unusable faces crop
+                # Vertically align the face crop using landmarks detection
+                rec_face , anti_spoof_face = align_face_with_landmarks(face_crop, frame, (xmin,ymin,xmax,ymax))
+                #rec_face=gray_world_correction(rec_face)
+                frame[ymin:ymax, xmin:xmax] = cv2.resize(anti_spoof_face,crop_dims)
+                # 3. Run recognition on the face crop
+                rec_input = recognition_preprocess(rec_face).transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
+                rec_embedding = compiled_rec([rec_input])[compiled_rec.output(0)]
+                # Compare with every reference embedding
+                similarities = [cosine_similarity(ref_emb, rec_embedding) for ref_emb in new_face]
+                face_preview = cv2.resize(rec_face, (128, 128))
+                # You can adjust your threshold accordingly
+                if username == "root":
+                    print(display_bgr_term(rec_face),end="")
+                if all([0.2 < sim < IMPROVE_THRESHOLD for sim in similarities]) or len(new_face)==0: # use as training image
+                    new_face.append(rec_embedding)
+                    appened=True
+                break
+            if appened:
+                quality_score = recognition_quality(frame)
+                if not complete:
+                    total_progress+=((quality_score)*15) 
+                else:
+                    total_progress+=((quality_score)*7.5)
+
+            text = f"Face training : {total_progress:.2f} %"
+            cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2, cv2.LINE_AA)
+            bar_x, bar_y = 10, 50
+            bar_w = 550
+            if not username == "root":
+                print(total_progress)
+            progress = int(total_progress/100 * bar_w)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 20), (100, 100, 100), -1)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + progress, bar_y + 20), (0, 255, 0), -1)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 20), (255, 255, 255), 2)
+            if not username == "root":
+                cv2.imshow("Webcam - Press 's' to save face", frame)
             else:
-                total_progress+=((quality_score)*2.5)
+                print(" " + str(int(total_progress))+"%",end="\r")
+                if keyboard.is_pressed("q"):
+                    break
+            appended=False
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            if total_progress>=100:
+                print("Succeeded to record needed data...\nYour face has been recorded.")
+                print(len(new_face),"images registered successfully.")
 
-        text = f"Face training : {total_progress:.2f} %"
-        cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2, cv2.LINE_AA)
-        bar_x, bar_y = 10, 50
-        bar_w = 550
-        if not username == "root":
-            print(total_progress)
-        progress = int(total_progress/100 * bar_w)
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 20), (100, 100, 100), -1)
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + progress, bar_y + 20), (0, 255, 0), -1)
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 20), (255, 255, 255), 2)
-        if not username == "root":
-            cv2.imshow("Webcam - Press 's' to save face", frame)
-        else:
-            print(" " + str(int(total_progress))+"%",end="\r")
-        appended=False
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-        if total_progress>=100:
-            print("Succeeded to record needed data...\nYour face has been recorded.")
-            print(len(new_face),"images registered successfully.")
-
-            break
+                break
+    except KeyboardInterrupt: pass
                 
     cap.release()
     # save faces as vertex data (safer than images and faster to load)
