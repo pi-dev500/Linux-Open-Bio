@@ -1,1 +1,9 @@
 pam-fprint-grosshack/
+models/face-detection-retail-0005.bin
+models/face-detection-retail-0005.xml
+models/face-reidentification-retail-0095.bin
+models/face-reidentification-retail-0095.xml
+models/landmarks-regression-retail-0009.bin
+models/landmarks-regression-retail-0009.xml
+pam_face.o
+pam_face.so
