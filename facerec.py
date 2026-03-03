@@ -354,7 +354,7 @@ def check(username,n_try=5, timeout=RECOGNITION_TIMEOUT, commands_trigger=()):
             cap = cv2.VideoCapture(CAP_PATHS[current_cap])
             continue
         ret, frame = cap.read()
-        if not ret:
+        if not ret or frame is None or frame.size == 0:
             break
         frame = ensure_bgr(frame)
         
