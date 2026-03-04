@@ -23,6 +23,9 @@ cp -r "$DIR/models" /usr/share/face_recognition
 
 chmod +x /usr/share/face_recognition/*.py
 echo Restarting services...
+systemctl daemon-reload
+sudo systemctl reload dbus
+systemctl enable org.FaceRecognition
 systemctl stop org.FaceRecognition
 systemctl start org.FaceRecognition
 EOF
