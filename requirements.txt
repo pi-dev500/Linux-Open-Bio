@@ -5,3 +5,4 @@ numpy
 openvino
 yaml
 requests
+keyboard
